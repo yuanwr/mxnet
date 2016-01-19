@@ -69,7 +69,9 @@ def check_slice_channel(dim, num):
     exe.backward(o_nd)
     assert reldiff(grad_nd[0].asnumpy(), np.hstack([ins[i] + i for i in range(num)])) < 1e-5
 
-def check_concat_with_shape(shapes, dimension):
+def check_concat_with_shape(shapes, dimension, skip_second):
+    # if skip_second is True, second argument will not have gradient.
+    # it is to test #1130
     n = len(shapes)
     # forward
     target_dim = 0
@@ -83,12 +85,19 @@ def check_concat_with_shape(shapes, dimension):
         arr[i][:] = shapes[i][dimension]
     arr_np = [np.copy(narray.asnumpy()) for narray in arr]
     arr_grad = [mx.nd.empty(shape) for shape in shapes]
+    dict_grad = {}
+    arg_names = out.list_arguments()
+
+    for name, g in zip(arg_names, arr_grad):
+        if not skip_second or name != 'arg1':
+            dict_grad[name] = g
+    
     args = out.list_arguments()
     arg_shapes, out_shapes, aux_shapes = out.infer_shape(**dict(zip(args, shapes)))
     out_grad = mx.nd.empty(out_shapes[0])
     exec1 = out.bind(mx.Context('cpu'),
                      args=arr,
-                     args_grad=arr_grad)
+                     args_grad=dict_grad)
     exec1.forward()
     out1 = exec1.outputs[0]
     ret = np.concatenate([narray.asnumpy() for narray in arr], axis=dimension)
@@ -97,8 +106,12 @@ def check_concat_with_shape(shapes, dimension):
     out1.copyto(out_grad)
     out_grad[:] += 1
     exec1.backward([out_grad])
-    for grad, np_grad in zip(arr_grad, arr_np):
-        assert same(grad.asnumpy(), np_grad + 1)
+
+    for i, name in enumerate(arg_names):
+        if not skip_second or name != 'arg1':
+            grad = dict_grad[name]
+            np_grad = arr_np[i]
+            assert same(grad.asnumpy(), np_grad + 1)
 
 def test_concat():
     for dimension in range(4):
@@ -116,7 +129,8 @@ def test_concat():
                         shapes.append((merge[i], a))
                     elif dimension == 1:
                         shapes.append((a, merge[i]))
-                    check_concat_with_shape(shapes,dimension)
+                    check_concat_with_shape(shapes,dimension,True)
+                    check_concat_with_shape(shapes,dimension,False)
         #test 3D
         if dimension<3:
             for dim in range(2, 6):
@@ -128,7 +142,8 @@ def test_concat():
                         shapes.append((a,merge[i],b))
                     elif dimension ==2:
                         shapes.append((a,b,merge[i]))
-                check_concat_with_shape(shapes,dimension)
+                check_concat_with_shape(shapes,dimension,True)
+                check_concat_with_shape(shapes,dimension,False)
         # test 4D
         for dim in range(2, 6):
             shapes = []
@@ -141,7 +156,8 @@ def test_concat():
                     shapes.append((a,b,merge[i],c))
                 elif dimension ==3:
                     shapes.append((a,b,c,merge[i]))
-            check_concat_with_shape(shapes,dimension)
+            check_concat_with_shape(shapes,dimension,True)
+            check_concat_with_shape(shapes,dimension,False)
 
 def test_slice_channel():
     check_slice_channel(2, 4)
@@ -621,6 +637,29 @@ def test_nearest_upsampling():
                     shapes = [(1,3,base*root_scale*scale**(num_shape-1-i),base*root_scale*scale**(num_shape-1-i)) for i in range(num_shape)]
                     check_nearest_upsampling_with_shape(shapes, scale, root_scale)
 
+def test_batchnorm_training():
+    for shape in [(2, 3), (2, 3, 2, 2)]:
+        data_tmp = np.random.normal(size=shape)
+        s = shape[1],
+        gamma = np.ones(s)
+        beta = np.ones(s)
+        gamma[1] = 3
+        beta[0] = 3
+
+        rolling_mean = np.random.uniform(size=s)
+        rolling_std = np.random.uniform(size=s)
+
+        data = mx.symbol.Variable('data')
+        test = mx.symbol.BatchNorm(data, fix_gamma=False)
+
+        check_numeric_gradient(test, [data_tmp, gamma, beta], [rolling_mean, rolling_std], numeric_eps=1e-3, check_eps=5e-2)
+
+        # Gamma needs to be fixed at one when fix_gamma is true,
+        gamma = np.ones(s)
+
+        test = mx.symbol.BatchNorm(data, fix_gamma=True)
+        check_numeric_gradient(test, [data_tmp, gamma, beta], [rolling_mean, rolling_std], numeric_eps=1e-3, check_eps=5e-2)
+
 if __name__ == '__main__':
     test_nearest_upsampling()
     test_binary_op_duplicate_input()
@@ -641,5 +680,6 @@ if __name__ == '__main__':
     test_abs()
     test_round_ceil_floor()
     test_deconvolution()
+    test_batchnorm_training()
     #check_softmax_with_shape((3,4), mx.cpu())
     #check_multi_softmax_with_shape((3,4,5), mx.cpu())
